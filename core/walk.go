@@ -17,7 +17,16 @@ distributed under the License is distributed on an "AS IS" BASIS,
 package build
 
 // WalkFunc is the type of the function called for each expression tree visited by Walk.
-type WalkFunc func(x Expr, stk []Expr) Expr
+type WalkFunc func(x Expr, stk []Expr)
+
+// EditFunc is the type of the function called for each expression tree visited by Edit.
+type EditFunc func(x Expr, stk []Expr) Expr
+
+// Edit converts a WalkFunc into an EditFunc.
+func (f WalkFunc) Edit(x Expr, stk []Expr) Expr {
+	f(x, stk)
+	return nil
+}
 
 // Walk walks the expression tree v, calling f on all subexpressions
 // in a preorder traversal.
@@ -27,10 +36,8 @@ type WalkFunc func(x Expr, stk []Expr) Expr
 //
 func Walk(v Expr, f WalkFunc) {
 	var stack []Expr
-	walk1(&v, &stack, func(x Expr, stk []Expr) Expr {
-		f(x, stk)
-		return nil
-	})
+
+	walk1(&v, &stack, f.Edit)
 }
 
 // Edit walks the expression tree v, calling f on all subexpressions
@@ -40,7 +47,7 @@ func Walk(v Expr, f WalkFunc) {
 // The stk argument is the stack of expressions in the recursion above x,
 // from outermost to innermost.
 //
-func Edit(v Expr, f WalkFunc) Expr {
+func Edit(v Expr, f EditFunc) Expr {
 	var stack []Expr
 	return walk1(&v, &stack, f)
 }
@@ -51,7 +58,7 @@ func Edit(v Expr, f WalkFunc) Expr {
 // of nodes. Using a pointer to a slice here ensures that
 // as the stack grows and shrinks the storage can be
 // reused for the next growth.
-func walk1(v *Expr, stack *[]Expr, f WalkFunc) Expr {
+func walk1(v *Expr, stack *[]Expr, f EditFunc) Expr {
 	if v == nil {
 		return nil
 	}

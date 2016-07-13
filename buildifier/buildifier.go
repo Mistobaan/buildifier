@@ -26,6 +26,7 @@ import (
 	"runtime"
 	"sort"
 	"strings"
+	"sync"
 
 	build "github.com/bazelbuild/buildifier/core"
 	"github.com/bazelbuild/buildifier/differ"
@@ -119,15 +120,10 @@ func main() {
 
 	if len(args) == 0 {
 		// Read from stdin, write to stdout.
-		data, err := ioutil.ReadAll(os.Stdin)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "buildifier: reading stdin: %v\n", err)
-			os.Exit(2)
-		}
 		if *mode == "fix" {
 			*mode = "pipe"
 		}
-		processFile("stdin", data)
+		processFiles([]string{"stdin"})
 	} else {
 		processFiles(args)
 	}
@@ -142,51 +138,49 @@ func main() {
 }
 
 func processFiles(files []string) {
-	// Decide how many file reads to run in parallel.
-	// At most 100, and at most one per 10 input files.
-	nworker := 100
-	if n := (len(files) + 9) / 10; nworker > n {
-		nworker = n
-	}
-	runtime.GOMAXPROCS(nworker + 1)
-
 	// Start nworker workers reading stripes of the input
 	// argument list and sending the resulting data on
 	// separate channels. file[k] is read by worker k%nworker
 	// and delivered on ch[k%nworker].
 	type result struct {
 		file string
-		data []byte
 		err  error
 	}
-	ch := make([]chan result, nworker)
-	for i := 0; i < nworker; i++ {
-		ch[i] = make(chan result, 1)
-		go func(i int) {
-			for j := i; j < len(files); j += nworker {
-				file := files[j]
-				data, err := ioutil.ReadFile(file)
-				ch[i] <- result{file, data, err}
-			}
-		}(i)
+
+	if len(files) == 0 {
+		// nothing to process
+		return
 	}
 
-	// Process files. The processing still runs in a single goroutine
-	// in sequence. Only the reading of the files has been parallelized.
-	// The goal is to optimize for runs where most files are already
-	// formatted correctly, so that reading is the bulk of the I/O.
-	for i, file := range files {
-		res := <-ch[i%nworker]
-		if res.file != file {
-			fmt.Fprintf(os.Stderr, "buildifier: internal phase error: got %s for %s", res.file, file)
-			os.Exit(3)
-		}
+	var wg sync.WaitGroup
+
+	in := make(chan string)
+	ch := make(chan result, len(files))
+
+	for i := 0; i < runtime.NumCPU(); i++ {
+		wg.Add(1)
+		go func() {
+			for filename := range in {
+				err := processFile(filename)
+				if err != nil {
+					ch <- result{filename, err}
+				}
+			}
+			wg.Done()
+		}()
+	}
+	for _, fname := range files {
+		in <- fname
+	}
+	close(in)
+	wg.Wait()
+	close(ch)
+
+	for res := range ch {
 		if res.err != nil {
 			fmt.Fprintf(os.Stderr, "buildifier: %v\n", res.err)
-			exitCode = 3
 			continue
 		}
-		processFile(file, res.data)
 	}
 }
 
@@ -207,24 +201,25 @@ var diff *differ.Differ
 
 // processFile processes a single file containing data.
 // It has been read from filename and should be written back if fixing.
-func processFile(filename string, data []byte) {
-	defer func() {
-		if err := recover(); err != nil {
-			fmt.Fprintf(os.Stderr, "buildifier: %s: internal error: %v\n", filename, err)
-			exitCode = 3
-		}
-	}()
+func processFile(filename string) error {
+	var (
+		data []byte
+		err  error
+	)
+
+	if filename == "stdin" {
+		data, err = ioutil.ReadAll(os.Stdin)
+	} else {
+		data, err = ioutil.ReadFile(filename)
+	}
+	if err != nil {
+		return err
+	}
 
 	f, err := build.Parse(filename, data)
 	if err != nil {
-		// Do not use buildifier: prefix on this error.
-		// Since it is a parse error, it begins with file:line:
-		// and we want that to be the first thing in the error.
-		fmt.Fprintf(os.Stderr, "%v\n", err)
-		if exitCode < 1 {
-			exitCode = 1
-		}
-		return
+
+		return nil
 	}
 
 	if *path != "" {
@@ -245,11 +240,12 @@ func processFile(filename string, data []byte) {
 			if !bytes.Equal(data, beforeRewrite) {
 				reformat = " reformat"
 			}
-			log := ""
+			var log string
+
 			if len(info.Log) > 0 && *showlog {
 				sort.Strings(info.Log)
 				var uniq []string
-				last := ""
+				var last string
 				for _, s := range info.Log {
 					if s != last {
 						last = s
@@ -260,18 +256,16 @@ func processFile(filename string, data []byte) {
 			}
 			fmt.Printf("%s #%s %s%s\n", filename, reformat, &info, log)
 		}
-		return
+		return nil
 
 	case "diff":
 		// diff mode: run diff on old and new.
 		if bytes.Equal(data, ndata) {
-			return
+			return nil
 		}
 		outfile, err := writeTemp(ndata)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "buildifier: %v\n", err)
-			exitCode = 3
-			return
+			return err
 		}
 		infile := filename
 		if filename == "" {
@@ -279,9 +273,7 @@ func processFile(filename string, data []byte) {
 			// Write it to a temporary file so diff can read it.
 			infile, err = writeTemp(data)
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "buildifier: %v\n", err)
-				exitCode = 3
-				return
+				return err
 			}
 		}
 		diff.Show(infile, outfile)
@@ -290,25 +282,26 @@ func processFile(filename string, data []byte) {
 		// pipe mode - reading from stdin, writing to stdout.
 		// ("pipe" is not from the command line; it is set above in main.)
 		os.Stdout.Write(ndata)
-		return
+		return nil
 
 	case "fix":
 		// fix mode: update files in place as needed.
 		if bytes.Equal(data, ndata) {
-			return
+			return nil
 		}
 
 		err := ioutil.WriteFile(filename, ndata, 0666)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "buildifier: %s\n", err)
-			exitCode = 3
-			return
+			return err
 		}
 
 		if *vflag {
 			fmt.Fprintf(os.Stderr, "fixed %s\n", filename)
 		}
+	default:
+		panic("mode not supported: " + *mode)
 	}
+	return nil
 }
 
 // writeTemp writes data to a temporary file and returns the name of the file.

@@ -34,6 +34,19 @@ func Parse(filename string, data []byte) (*File, error) {
 	return in.parse()
 }
 
+// ParseError is a parse error.
+type ParseError struct {
+	Filename string
+	Line     int
+	LineRune int
+	err      error
+}
+
+// Error implements the error interface.
+func (e *ParseError) Error() string {
+	return fmt.Sprintf("%s:%d:%d: %v", e.Filename, e.Line, e.LineRune, e.err)
+}
+
 // An input represents a single input file being parsed.
 type input struct {
 	// Lexing state.

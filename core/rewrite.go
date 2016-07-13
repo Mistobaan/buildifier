@@ -75,7 +75,7 @@ type RewriteInfo struct {
 }
 
 func (info *RewriteInfo) String() string {
-	s := ""
+	var s string
 	if info.EditLabel > 0 {
 		s += " label"
 	}
